@@ -39,7 +39,17 @@ type WhatsmeowConnection struct {
 	// Keep connection-in-progress state atomic because status and connect paths are
 	// touched from different goroutines.
 	isConnecting atomic.Bool
+
+	// dead463 caches destinations that exhausted all 463 retry attempts.
+	// Subsequent sends to a cached destination short-circuit until the TTL expires.
+	// Value type is time.Time (the cache expiration moment).
+	dead463 sync.Map
 }
+
+// TTL for entries in the dead463 cache. After this period a destination is
+// retried again from scratch in case the remote side recovered (e.g., user
+// unblocked, account re-validated).
+const send463DeadTTL = 10 * time.Minute
 
 //#region IMPLEMENT WHATSAPP CONNECTION OPTIONS INTERFACE
 
@@ -266,6 +276,46 @@ func isSendError463(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "server returned error 463")
 }
 
+// markDestinationDead records that all 463 retry attempts failed for the given
+// destination, so subsequent sends short-circuit until send463DeadTTL elapses.
+func (source *WhatsmeowConnection) markDestinationDead(destination string) {
+	if source == nil || len(destination) == 0 {
+		return
+	}
+	source.dead463.Store(destination, time.Now().Add(send463DeadTTL))
+}
+
+// isDestinationDead reports whether the destination is currently cached as
+// unreachable. Expired entries are evicted on lookup.
+func (source *WhatsmeowConnection) isDestinationDead(destination string) bool {
+	if source == nil || len(destination) == 0 {
+		return false
+	}
+	v, ok := source.dead463.Load(destination)
+	if !ok {
+		return false
+	}
+	expiresAt, ok := v.(time.Time)
+	if !ok {
+		source.dead463.Delete(destination)
+		return false
+	}
+	if time.Now().After(expiresAt) {
+		source.dead463.Delete(destination)
+		return false
+	}
+	return true
+}
+
+// clearDeadDestination removes the destination from the dead cache. Called on
+// successful sends so recovered destinations are not held back.
+func (source *WhatsmeowConnection) clearDeadDestination(destination string) {
+	if source == nil || len(destination) == 0 {
+		return
+	}
+	source.dead463.Delete(destination)
+}
+
 func (source *WhatsmeowConnection) resolveLIDRetryJID(currentJID types.JID) (types.JID, bool) {
 	if source == nil || source.GetContactManager() == nil {
 		return types.EmptyJID, false
@@ -463,6 +513,16 @@ func (source *WhatsmeowConnection) Send(msg *whatsapp.WhatsappMessage) (whatsapp
 		return msg, err
 	}
 
+	// short-circuit destinations that recently exhausted all 463 retries.
+	// Why: WhatsApp 463 after JID/LID/signal-reset retries usually means the
+	// remote side blocked us or the account is invalid — retrying again
+	// immediately just delays the error and risks rate-limit. TTL: see send463DeadTTL.
+	if source.isDestinationDead(formattedDestination) {
+		err = fmt.Errorf("recipient unreachable: WhatsApp error 463 cached after exhausted retries (ttl %s)", send463DeadTTL)
+		logentry.Warnf("send short-circuited, destination cached as unreachable: %s", formattedDestination)
+		return msg, err
+	}
+
 	// validating jid before remote commands as upload or send
 	jid, err := types.ParseJID(formattedDestination)
 	if err != nil {
@@ -605,10 +665,18 @@ func (source *WhatsmeowConnection) Send(msg *whatsapp.WhatsappMessage) (whatsapp
 		}
 
 		if err != nil {
+			if isSendError463(err) {
+				source.markDestinationDead(formattedDestination)
+				logentry.Warnf("destination cached as unreachable for %s after exhausting 463 retries: %s", send463DeadTTL, formattedDestination)
+			}
 			return msg, err
 		}
 		//endregion
 	}
+
+	// send succeeded — clear any prior dead-destination cache so a recovered
+	// recipient is not held back by a stale entry from a previous failure run.
+	source.clearDeadDestination(formattedDestination)
 
 	// updating timestamp
 	msg.Timestamp = resp.Timestamp
