@@ -316,6 +316,69 @@ func (source *WhatsmeowConnection) clearDeadDestination(destination string) {
 	source.dead463.Delete(destination)
 }
 
+// destinationAliases returns all known identifier forms (phone JID and LID)
+// for the destination, so the dead-destination cache stays symmetric — a
+// caller can't bypass a cached failure by switching between the two forms.
+func (source *WhatsmeowConnection) destinationAliases(primary string, jid types.JID) []string {
+	aliases := []string{primary}
+	if source == nil {
+		return aliases
+	}
+	cm := source.GetContactManager()
+	if cm == nil {
+		return aliases
+	}
+
+	addAlias := func(s string) {
+		if len(s) == 0 {
+			return
+		}
+		for _, existing := range aliases {
+			if existing == s {
+				return
+			}
+		}
+		aliases = append(aliases, s)
+	}
+
+	switch jid.Server {
+	case types.DefaultUserServer:
+		phone, err := whatsapp.GetPhoneIfValid(jid.String())
+		if err != nil || len(phone) == 0 {
+			return aliases
+		}
+		lid, err := cm.GetLIDFromPhone(phone)
+		if err != nil || len(lid) == 0 {
+			return aliases
+		}
+		addAlias(lid)
+	case types.HiddenUserServer:
+		phone, err := cm.GetPhoneFromLID(jid.String())
+		if err != nil || len(phone) == 0 {
+			return aliases
+		}
+		phoneJID := types.NewJID(strings.TrimPrefix(phone, "+"), types.DefaultUserServer)
+		addAlias(phoneJID.String())
+	}
+	return aliases
+}
+
+// markDestinationDeadAll marks the primary destination and any known alias
+// (phone JID ↔ LID) so subsequent sends to either form short-circuit.
+func (source *WhatsmeowConnection) markDestinationDeadAll(primary string, jid types.JID) {
+	for _, alias := range source.destinationAliases(primary, jid) {
+		source.markDestinationDead(alias)
+	}
+}
+
+// clearDeadDestinationAll removes the primary destination and any known alias
+// from the dead cache, so a recovered recipient is not held back via either form.
+func (source *WhatsmeowConnection) clearDeadDestinationAll(primary string, jid types.JID) {
+	for _, alias := range source.destinationAliases(primary, jid) {
+		source.clearDeadDestination(alias)
+	}
+}
+
 func (source *WhatsmeowConnection) resolveLIDRetryJID(currentJID types.JID) (types.JID, bool) {
 	if source == nil || source.GetContactManager() == nil {
 		return types.EmptyJID, false
@@ -666,7 +729,7 @@ func (source *WhatsmeowConnection) Send(msg *whatsapp.WhatsappMessage) (whatsapp
 
 		if err != nil {
 			if isSendError463(err) {
-				source.markDestinationDead(formattedDestination)
+				source.markDestinationDeadAll(formattedDestination, jid)
 				logentry.Warnf("destination cached as unreachable for %s after exhausting 463 retries: %s", send463DeadTTL, formattedDestination)
 			}
 			return msg, err
@@ -676,7 +739,7 @@ func (source *WhatsmeowConnection) Send(msg *whatsapp.WhatsappMessage) (whatsapp
 
 	// send succeeded — clear any prior dead-destination cache so a recovered
 	// recipient is not held back by a stale entry from a previous failure run.
-	source.clearDeadDestination(formattedDestination)
+	source.clearDeadDestinationAll(formattedDestination, jid)
 
 	// updating timestamp
 	msg.Timestamp = resp.Timestamp
