@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unsafe"
 
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -434,7 +435,60 @@ func (source *WhatsmeowConnection) resetSignalStateForTargets(targets ...types.J
 			logentry.Warnf("failed to clear sessions for %s: %v", signalUser, err)
 		}
 
-		logentry.Debugf("cleared signal state for retry target: %s", signalUser)
+		// Invalidate whatsmeow's in-memory user device cache so the next send
+		// re-fetches the recipient's current device list. Without this, a stale
+		// cache (recipient added/removed a linked device while we missed the
+		// notification) keeps causing 463 because we encrypt for outdated devices.
+		source.invalidateUserDevicesCache(target)
+	}
+}
+
+// invalidateUserDevicesCache forces whatsmeow to forget the cached device list
+// for `target`, so the next send triggers a fresh usync query. The cache field
+// is unexported, so this uses reflect+unsafe to bypass Go's export rules. Field
+// names are pinned to whatsmeow's current implementation — if the upstream
+// renames them, we log a warning and skip rather than break the retry flow.
+func (source *WhatsmeowConnection) invalidateUserDevicesCache(target types.JID) {
+	if source == nil || source.Client == nil || target.IsEmpty() {
+		return
+	}
+
+	logentry := source.GetLogger()
+
+	clientValue := reflect.ValueOf(source.Client).Elem()
+	cacheField := clientValue.FieldByName("userDevicesCache")
+	lockField := clientValue.FieldByName("userDevicesCacheLock")
+	if !cacheField.IsValid() || !lockField.IsValid() {
+		logentry.Warnf("user devices cache fields not found on whatsmeow.Client (incompatible version?); skipping cache invalidation for %s", target)
+		return
+	}
+
+	lockPtr := (*sync.Mutex)(unsafe.Pointer(lockField.UnsafeAddr()))
+	lockPtr.Lock()
+	defer lockPtr.Unlock()
+
+	mapValue := reflect.NewAt(cacheField.Type(), unsafe.Pointer(cacheField.UnsafeAddr())).Elem()
+	keys := []reflect.Value{
+		reflect.ValueOf(target),
+		reflect.ValueOf(target.ToNonAD()),
+	}
+	removed := 0
+	seen := map[string]bool{}
+	for _, k := range keys {
+		s := k.Interface().(types.JID).String()
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		if mapValue.MapIndex(k).IsValid() {
+			mapValue.SetMapIndex(k, reflect.Value{})
+			removed++
+		}
+	}
+	if removed > 0 {
+		logentry.Infof("invalidated whatsmeow user devices cache for %s (%d entries) to force device list refresh on retry", target, removed)
+	} else {
+		logentry.Debugf("whatsmeow user devices cache had no entry for %s; nothing to invalidate", target)
 	}
 }
 
